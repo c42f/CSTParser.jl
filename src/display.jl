@@ -31,7 +31,7 @@ function Base.show(io::IO, x::EXPR, offset = 0, d = 0, er = false)
     else
         printstyled(io, " "^d, T, color = c)
         if x.meta !== nothing
-            print(io, "( ")
+            print(io, " (")
             show(io, x.meta)
             print(io, ")")
         end
