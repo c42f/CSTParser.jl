@@ -122,11 +122,114 @@ end
 
 Base.Expr(x::EXPR) = to_Expr(x)
 
+"""
+    EXPRIndexer(cst::EXPR, text::AbstractString, filename)
+
+A wrapper for `EXPR` which adds a virtual `index` field (the index into the
+source string), and awareness of the line start locations in the source text.
+
+This allows EXPRIndexer to provide LineNumberNodes when converting EXPR to Expr.
+"""
+struct EXPRIndexer
+    cst::EXPR
+    arg_indices::Vector{Int}
+    line_starts::Vector{Int}
+    filename::Symbol
+end
+
+function EXPRIndexer(cst::EXPR, text::AbstractString, filename)
+    line_starts = Int[1]
+    for i in eachindex(text)
+        if text[i] == '\n'
+            push!(line_starts, i+1)
+        end
+    end
+    if last(text) != '\n'
+        push!(line_starts, lastindex(text)+1)
+    end
+    EXPRIndexer(cst, 1, line_starts, Symbol(filename))
+end
+
+function EXPRIndexer(cst::EXPR, parent_index::Integer, line_starts::Vector{Int}, filename)
+    arg_indices = Int[parent_index]
+    if cst.args !== nothing
+        for a in cst.args
+            push!(arg_indices, arg_indices[end]+a.fullspan)
+        end
+        @assert arg_indices[end] == parent_index + cst.fullspan
+    end
+    EXPRIndexer(cst, arg_indices, line_starts, filename)
+end
+
+function Base.getindex(xx::EXPRIndexer, i::Integer)
+    EXPRIndexer(xx.cst.args[i], xx.arg_indices[i], xx.line_starts, xx.filename)
+end
+
+Base.firstindex(xx::EXPRIndexer) = 1
+Base.lastindex(xx::EXPRIndexer)  = length(xx.cst.args)
+
+function Base.getproperty(xx::EXPRIndexer, name::Symbol)
+    # EXPRIndexer fields
+    if name === :cst
+        return getfield(xx, :cst)
+    elseif name === :arg_indices
+        return getfield(xx, :arg_indices)
+    elseif name === :line_starts
+        return getfield(xx, :line_starts)
+    elseif name === :filename
+        return getfield(xx, :filename)
+    elseif name === :index
+        return first(getfield(xx, :arg_indices))
+    end
+    # Wrapped EXPR fields
+    cst = getfield(xx, :cst)
+    if name === :args
+        return [xx[i] for i in 1:length(cst.args)]
+    elseif name === :parent
+        error("Parent link not supported")
+    else
+        return getproperty(cst, name)
+    end
+end
+
+for f in [:typof, :kindof, :errorof, :valof, :precedence,
+          :is_comma, :is_dot, :is_func_call, :isidentifier, :iskw,
+          :isliteral, :is_nothing, :isoperator, :ispunctuation,
+          :issyntaxcall, :issyntaxunarycall, :span]
+    @eval $f(xx::EXPRIndexer) =  $f(xx.cst)
+end
+
+Base.show(io::IO, xx::EXPRIndexer) = show(io, to_Expr(xx))
+
+function line_number_node(xx::EXPRIndexer)
+    line = searchsortedlast(xx.line_starts, xx.index)
+    if line == length(xx.line_starts)
+        line -= 1
+    end
+    return LineNumberNode(line, xx.filename)
+end
+
+line_number_node(x) = nothing
+
+function push_line_node!(args, x)
+    loc = line_number_node(x)
+    if loc !== nothing
+        push!(args, loc)
+    end
+end
+
+function pushfirst_line_node!(args, x)
+    loc = line_number_node(x)
+    if loc !== nothing
+        pushfirst!(args, loc)
+    end
+end
+
 # Fallback
 function to_Expr(x)
     if isidentifier(x)
         if typof(x) === NONSTDIDENTIFIER
-            Symbol(normalize_julia_identifier(valof(x.args[2])))
+            Symbol(normalize_julia_identifier(valof(x[2])))
         else
             return Symbol(normalize_julia_identifier(valof(x)))
         end
@@ -152,7 +255,7 @@ function to_Expr(x)
     elseif iswherecall(x)
         return _where_expr(x)
     elseif typof(x) === ConditionalOpCall
-        return Expr(:if, to_Expr(x.args[1]), to_Expr(x.args[3]), to_Expr(x.args[5]))
+        return Expr(:if, to_Expr(x[1]), to_Expr(x[3]), to_Expr(x[5]))
     elseif typof(x) === ErrorToken
         ret = Expr(:error)
         if x.args !== nothing
@@ -164,10 +267,10 @@ function to_Expr(x)
         end
         return ret
     elseif typof(x) === ChainOpCall
-        ret = Expr(:call, to_Expr(x.args[2]))
+        ret = Expr(:call, to_Expr(x[2]))
         for i = 1:length(x.args)
             if isodd(i)
-                push!(ret.args, to_Expr(x.args[i]))
+                push!(ret.args, to_Expr(x[i]))
             end
         end
         return ret
@@ -180,7 +283,7 @@ function to_Expr(x)
         end
         return ret
     elseif typof(x) === ColonOpCall
-        return Expr(:call, :(:), to_Expr(x.args[1]), to_Expr(x.args[3]), to_Expr(x.args[5]))
+        return Expr(:call, :(:), to_Expr(x[1]), to_Expr(x[3]), to_Expr(x[5]))
     elseif typof(x) === TopLevel
         ret = Expr(:toplevel)
         for a in x.args
@@ -190,14 +293,14 @@ function to_Expr(x)
         end
         return ret
     elseif typof(x) === MacroName
-        if isidentifier(x.args[2])
-            if valof(x.args[2]) == "."
+        if isidentifier(x[2])
+            if valof(x[2]) == "."
                 return Symbol("@", "__dot__")
             else
-                return Symbol("@", valof(x.args[2]))
+                return Symbol("@", valof(x[2]))
             end
-        elseif isoperator(x.args[2])
-            return Symbol("@", to_Expr(x.args[2]))
+        elseif isoperator(x[2])
+            return Symbol("@", to_Expr(x[2]))
         else
             return Symbol("@")
         end
@@ -208,7 +311,7 @@ function to_Expr(x)
                 push!(ret.args, to_Expr(a))
             end
         end
-        insert!(ret.args, 2, nothing)
+        insert!(ret.args, 2, line_number_node(x))
         if ret.args[1] isa Expr && ret.args[1].head == :. && string(ret.args[1].args[2].value)[1] != '@'
             clear_at!(ret.args[1])
             ret.args[1].args[2] = QuoteNode(Symbol(string('@', ret.args[1].args[2].value)))
@@ -216,29 +319,29 @@ function to_Expr(x)
         ret
     elseif typof(x) === x_Str
         if isbinarycall(x.args[1]) && issyntaxcall(x.args[1].args[2])
-            mname = to_Expr(x.args[1])
+            mname = to_Expr(x[1])
             mname.args[2] = QuoteNode(Symbol("@", mname.args[2].value, "_str"))
-            ret = Expr(:macrocall, mname, nothing)
+            ret = Expr(:macrocall, mname, line_number_node(x))
         else
-            ret = Expr(:macrocall, Symbol("@", valof(x.args[1]), "_str"), nothing)
+            ret = Expr(:macrocall, Symbol("@", valof(x[1]), "_str"), line_number_node(x))
         end
         for i = 2:length(x.args)
-            push!(ret.args, valof(x.args[i]))
+            push!(ret.args, valof(x[i]))
         end
         return ret
     elseif typof(x) === x_Cmd
-        ret = Expr(:macrocall, Symbol("@", valof(x.args[1]), "_cmd"), nothing)
+        ret = Expr(:macrocall, Symbol("@", valof(x[1]), "_cmd"), line_number_node(x))
         for i = 2:length(x.args)
-            push!(ret.args, valof(x.args[i]))
+            push!(ret.args, valof(x[i]))
         end
         return ret
     elseif typof(x) === Quotenode
-        return QuoteNode(to_Expr(x.args[end]))
+        return QuoteNode(to_Expr(x[end]))
     elseif typof(x) === Call
-        if kindof(x.args[1]) === Tokens.ISSUBTYPE || kindof(x.args[1]) === Tokens.ISSUPERTYPE
-            ret = Expr(to_Expr(x.args[1]))
+        if kindof(x[1]) === Tokens.ISSUBTYPE || kindof(x[1]) === Tokens.ISSUPERTYPE
+            ret = Expr(to_Expr(x[1]))
             for i in 2:length(x.args)
-                a = x.args[i]
+                a = x[i]
                 if typof(a) === Parameters
                     insert!(ret.args, 2, to_Expr(a))
                 elseif !(ispunctuation(a))
@@ -277,13 +380,13 @@ function to_Expr(x)
         end
         return ret
     elseif typof(x) === Struct
-        return Expr(:struct, false, to_Expr(x.args[2]), to_Expr(x.args[3]))
+        return Expr(:struct, false, to_Expr(x[2]), to_Expr(x[3]))
     elseif typof(x) === Mutable
-        return length(x.args) == 4 ? Expr(:struct, true, to_Expr(x.args[2]), to_Expr(x.args[3])) : Expr(:struct, true, to_Expr(x.args[3]), to_Expr(x.args[4]))
+        return length(x.args) == 4 ? Expr(:struct, true, to_Expr(x[2]), to_Expr(x[3])) : Expr(:struct, true, to_Expr(x[3]), to_Expr(x[4]))
     elseif typof(x) === Abstract
-        return length(x.args) == 2 ? Expr(:abstract, to_Expr(x.args[2])) : Expr(:abstract, to_Expr(x.args[3]))
+        return length(x.args) == 2 ? Expr(:abstract, to_Expr(x[2])) : Expr(:abstract, to_Expr(x[3]))
     elseif typof(x) === Primitive
-        return Expr(:primitive, to_Expr(x.args[3]), to_Expr(x.args[4]))
+        return Expr(:primitive, to_Expr(x[3]), to_Expr(x[4]))
     elseif typof(x) === FunctionDef
         ret = Expr(:function)
         for a in x.args
@@ -291,17 +394,20 @@ function to_Expr(x)
                 push!(ret.args, to_Expr(a))
             end
         end
+        if length(ret.args) > 1
+            pushfirst_line_node!(ret.args[2].args, x)
+        end
         return ret
     elseif typof(x) === Macro
         if length(x.args) == 3
-            Expr(:macro, to_Expr(x.args[2]))
+            Expr(:macro, to_Expr(x[2]))
         else
-            Expr(:macro, to_Expr(x.args[2]), to_Expr(x.args[3]))
+            Expr(:macro, to_Expr(x[2]), to_Expr(x[3]))
         end
     elseif typof(x) === ModuleH
-        return Expr(:module, true, to_Expr(x.args[2]), to_Expr(x.args[3]))
+        return Expr(:module, true, to_Expr(x[2]), to_Expr(x[3]))
     elseif typof(x) === BareModule
-        return Expr(:module, false, to_Expr(x.args[2]), to_Expr(x.args[3]))
+        return Expr(:module, false, to_Expr(x[2]), to_Expr(x[3]))
     elseif typof(x) === If
         return _if_expr(x)
     elseif typof(x) === Try
@@ -315,23 +421,23 @@ function to_Expr(x)
     elseif typof(x) === Let
         return _let_expr(x)
     elseif typof(x) === Do
-        return Expr(:do, to_Expr(x.args[1]), Expr(:->, to_Expr(x.args[3]), to_Expr(x.args[4])))
+        return Expr(:do, to_Expr(x[1]), Expr(:->, to_Expr(x[3]), to_Expr(x[4])))
     elseif typof(x) === Outer
-        return Expr(:outer, to_Expr(x.args[2]))
+        return Expr(:outer, to_Expr(x[2]))
     elseif typof(x) === For
         ret = Expr(:for)
-        if typof(x.args[2]) === Block
+        if typof(x[2]) === Block
             arg = Expr(:block)
-            for a in x.args[2].args
+            for a in x[2].args
                 if !(ispunctuation(a))
                     push!(arg.args, fix_range(a))
                 end
             end
             push!(ret.args, arg)
         else
-            push!(ret.args, fix_range(x.args[2]))
+            push!(ret.args, fix_range(x[2]))
         end
-        push!(ret.args, to_Expr(x.args[3]))
+        push!(ret.args, to_Expr(x[3]))
         return ret
     elseif typof(x) === While
         ret = Expr(:while)
@@ -399,12 +505,13 @@ function to_Expr(x)
         ret = Expr(:block)
         for a in x.args
             if !(ispunctuation(a))
+                push_line_node!(ret.args, a)
                 push!(ret.args, to_Expr(a))
             end
         end
         return ret
     elseif typof(x) === Kw
-        return Expr(:kw, to_Expr(x.args[1]), to_Expr(x.args[3]))
+        return Expr(:kw, to_Expr(x[1]), to_Expr(x[3]))
     elseif typof(x) === Parameters
         ret = Expr(:parameters)
         for a in x.args
@@ -418,52 +525,52 @@ function to_Expr(x)
     elseif typof(x) === Return
         ret = Expr(:return)
         for i = 2:length(x.args)
-            a = x.args[i]
+            a = x[i]
             push!(ret.args, to_Expr(a))
         end
         return ret
     elseif isbracketed(x)
-        return to_Expr(x.args[2])
+        return to_Expr(x[2])
     elseif typof(x) === Begin
-        return to_Expr(x.args[2])
+        return to_Expr(x[2])
     elseif typof(x) === Quote
         if length(x.args) == 1
-            return Expr(:quote, to_Expr(x.args[1]))
-        elseif isbracketed(x.args[2]) && (isoperator(x.args[2].args[2]) || isliteral(x.args[2].args[2]) || isidentifier(x.args[2].args[2]))
-            return QuoteNode(to_Expr(x.args[2]))
+            return Expr(:quote, to_Expr(x[1]))
+        elseif isbracketed(x[2]) && (isoperator(x[2][2]) || isliteral(x[2][2]) || isidentifier(x[2][2]))
+            return QuoteNode(to_Expr(x[2]))
         else
-            return Expr(:quote, to_Expr(x.args[2]))
+            return Expr(:quote, to_Expr(x[2]))
         end
     elseif typof(x) === Global
         ret = Expr(:global)
-        if typof(x.args[2]) === Const
-            ret = Expr(:const, Expr(:global, to_Expr(x.args[2].args[2])))
-        elseif length(x.args) == 2 && istuple(x.args[2])
-            for a in x.args[2].args
+        if typof(x[2]) === Const
+            ret = Expr(:const, Expr(:global, to_Expr(x[2][2])))
+        elseif length(x.args) == 2 && istuple(x[2])
+            for a in x[2].args
                 if !(ispunctuation(a))
                     push!(ret.args, to_Expr(a))
                 end
             end
         else
             for i = 2:length(x.args)
-                a = x.args[i]
+                a = x[i]
                 push!(ret.args, to_Expr(a))
             end
         end
         return ret
     elseif typof(x) === Local
         ret = Expr(:local)
-        if typof(x.args[2]) === Const
-            ret = Expr(:const, Expr(:global, to_Expr(x.args[2].args[2])))
-        elseif length(x.args) == 2 && istuple(x.args[2])
-            for a in x.args[2].args
+        if typof(x[2]) === Const
+            ret = Expr(:const, Expr(:global, to_Expr(x[2][2])))
+        elseif length(x.args) == 2 && istuple(x[2])
+            for a in x[2].args
                 if !(ispunctuation(a))
                     push!(ret.args, to_Expr(a))
                 end
             end
         else
             for i = 2:length(x.args)
-                a = x.args[i]
+                a = x[i]
                 push!(ret.args, to_Expr(a))
             end
         end
@@ -471,7 +578,7 @@ function to_Expr(x)
     elseif typof(x) === Const
         ret = Expr(:const)
         for i = 2:length(x.args)
-            a = x.args[i]
+            a = x[i]
             push!(ret.args, to_Expr(a))
         end
         return ret
@@ -531,9 +638,9 @@ function to_Expr(x)
         end
         return ex
     elseif typof(x) === Generator
-        ret = Expr(:generator, to_Expr(x.args[1]))
+        ret = Expr(:generator, to_Expr(x[1]))
         for i = 3:length(x.args)
-            a = x.args[i]
+            a = x[i]
             if !(ispunctuation(a))
                 push!(ret.args, convert_iter_assign(a))
             end
@@ -543,7 +650,7 @@ function to_Expr(x)
         ret = Expr(:filter)
         push!(ret.args, to_Expr(last(x.args)))
         for i in 1:length(x.args) - 1
-            a = x.args[i]
+            a = x[i]
             if !(is_if(a) || ispunctuation(a))
                 push!(ret.args, convert_iter_assign(a))
             end
@@ -564,7 +671,7 @@ function to_Expr(x)
     elseif typof(x) === Export
         ret = Expr(:export)
         for i = 2:length(x.args)
-            a = x.args[i]
+            a = x[i]
             if !(ispunctuation(a))
                 push!(ret.args, to_Expr(a))
             end
@@ -573,6 +680,7 @@ function to_Expr(x)
     elseif typof(x) === FileH
         ret = Expr(:file)
         for a in x.args
+            push_line_node!(ret.args, a)
             push!(ret.args, to_Expr(a))
         end
         return ret
@@ -580,7 +688,7 @@ function to_Expr(x)
         ret = Expr(:string)
         for (i, a) in enumerate(x.args)
             if isunarycall(a)
-                a = a.args[2]
+                a = a[2]
             elseif isliteral(a) && kindof(a) === Tokens.STRING && span(a) == 0 || ((i == 1 || i == length(x.args)) && span(a) == 1) || (valof(a) === nothing || isempty(valof(a)))
                 continue
             else isliteral(a) && kindof(a) === Tokens.TRIPLE_STRING && span(a) == 0 || ((i == 1 || i == length(x.args)) && span(a) == 3) || (valof(a) === nothing || isempty(valof(a)))
@@ -602,34 +710,43 @@ end
 # Op. expressions
 
 function _unary_expr(x)
-    if isoperator(x.args[1]) && issyntaxunarycall(x.args[1])
-        Expr(to_Expr(x.args[1]), to_Expr(x.args[2]))
-    elseif isoperator(x.args[2]) && issyntaxunarycall(x.args[2])
-        Expr(to_Expr(x.args[2]), to_Expr(x.args[1]))
+    if isoperator(x[1]) && issyntaxunarycall(x[1])
+        Expr(to_Expr(x[1]), to_Expr(x[2]))
+    elseif isoperator(x[2]) && issyntaxunarycall(x[2])
+        Expr(to_Expr(x[2]), to_Expr(x[1]))
     else
-        Expr(:call, to_Expr(x.args[1]), to_Expr(x.args[2]))
+        Expr(:call, to_Expr(x[1]), to_Expr(x[2]))
     end
 end
+
 function _binary_expr(x)
-    if issyntaxcall(x.args[2]) && !(kindof(x.args[2]) in (Tokens.COLON,))
-        if kindof(x.args[2]) === Tokens.DOT
-            arg1, arg2 = to_Expr(x.args[1]), to_Expr(x.args[3])
+    if issyntaxcall(x[2]) && !(kindof(x[2]) in (Tokens.COLON,))
+        if kindof(x[2]) === Tokens.DOT
+            arg1, arg2 = to_Expr(x[1]), to_Expr(x[3])
             if arg2 isa Expr && arg2.head === :macrocall && endswith(string(arg2.args[1]), "_cmd")
-                return Expr(:macrocall, Expr(:., arg1, QuoteNode(arg2.args[1])), nothing, arg2.args[3])
+                return Expr(:macrocall, Expr(:., arg1, QuoteNode(arg2.args[1])), arg2.args[2], arg2.args[3])
             elseif arg2 isa Expr && arg2.head === :braces
                 return Expr(:., arg1, Expr(:quote, arg2))
             end
         end
-        Expr(to_Expr(x.args[2]), to_Expr(x.args[1]), to_Expr(x.args[3]))
+        ex = Expr(to_Expr(x[2]), to_Expr(x[1]), to_Expr(x[3]))
+        if VERSION >= v"1.5-DEV"
+            if is_func_call(x[1]) && precedence(x[1]) == AssignmentOp
+                # line for functionloc
+                @show x
+                pushfirst_line_node!(ex.args[2].args, x[1])
+            end
+        end
+        ex
     else
-        Expr(:call, to_Expr(x.args[2]), to_Expr(x.args[1]), to_Expr(x.args[3]))
+        Expr(:call, to_Expr(x[2]), to_Expr(x[1]), to_Expr(x[3]))
     end
 end
 
 function _where_expr(x)
-    ret = Expr(:where, to_Expr(x.args[1]))
+    ret = Expr(:where, to_Expr(x[1]))
     for i = 3:length(x.args)
-        a = x.args[i]
+        a = x[i]
         if typof(a) === Parameters
             insert!(ret.args, 2, to_Expr(a))
         elseif !(ispunctuation(a) || iskw(a))
@@ -640,13 +757,12 @@ function _where_expr(x)
 end
 
 
-# cross compatability for line number insertion in macrocalls
 if VERSION > v"1.1-"
-    Expr_cmd(x) = Expr(:macrocall, GlobalRef(Core, Symbol("@cmd")), nothing, valof(x))
-    Expr_tcmd(x) = Expr(:macrocall, GlobalRef(Core, Symbol("@cmd")), nothing, valof(x))
+    Expr_cmd(x) = Expr(:macrocall, GlobalRef(Core, Symbol("@cmd")), line_number_node(x), valof(x))
+    Expr_tcmd(x) = Expr(:macrocall, GlobalRef(Core, Symbol("@cmd")), line_number_node(x), valof(x))
 else
-    Expr_cmd(x) = Expr(:macrocall, Symbol("@cmd"), nothing, valof(x))
-    Expr_tcmd(x) = Expr(:macrocall, Symbol("@cmd"), nothing, valof(x))
+    Expr_cmd(x) = Expr(:macrocall, Symbol("@cmd"), line_number_node(x), valof(x))
+    Expr_tcmd(x) = Expr(:macrocall, Symbol("@cmd"), line_number_node(x), valof(x))
 end
 
 
@@ -693,15 +809,14 @@ end
 
 function _if_expr(x)
     ret = Expr(:if)
-    iselseif = false
     n = length(x.args)
     i = 0
     while i < n
         i += 1
-        a = x.args[i]
+        a = x[i]
         if iskw(a) && kindof(a) === Tokens.ELSEIF
             i += 1
-            r1 = to_Expr(x.args[i].args[1])
+            r1 = to_Expr(x[i][1])
             push!(ret.args, Expr(:elseif, r1.args...))
         elseif !(ispunctuation(a) || iskw(a))
             push!(ret.args, to_Expr(a))
@@ -714,26 +829,27 @@ function _let_expr(x)
     ret = Expr(:let)
     if length(x.args) == 3
         push!(ret.args, Expr(:block))
-        push!(ret.args, to_Expr(x.args[2]))
+        push!(ret.args, to_Expr(x[2]))
         return ret
-    elseif typof(x.args[2]) === Block
+    elseif typof(x[2]) === Block
         arg = Expr(:block)
-        for a in x.args[2].args
+        for a in x[2].args
             if !(ispunctuation(a))
+                push_line_node!(arg.args, a)
                 push!(arg.args, fix_range(a))
             end
         end
         push!(ret.args, arg)
     else
-        push!(ret.args, fix_range(x.args[2]))
+        push!(ret.args, fix_range(x[2]))
     end
-    push!(ret.args, to_Expr(x.args[3]))
+    push!(ret.args, to_Expr(x[3]))
     ret
 end
 
 function fix_range(a)
-    if isbinarycall(a) && (is_in(a.args[2]) || is_elof(a.args[2]))
-        Expr(:(=), to_Expr(a.args[1]), to_Expr(a.args[3]))
+    if isbinarycall(a) && (is_in(a[2]) || is_elof(a[2]))
+        Expr(:(=), to_Expr(a[1]), to_Expr(a[3]))
     else
         to_Expr(a)
     end
@@ -741,14 +857,14 @@ end
 
 function get_inner_gen(x, iters = [], arg = [])
     if typof(x) == Flatten
-        get_inner_gen(x.args[1], iters, arg)
+        get_inner_gen(x[1], iters, arg)
     elseif typof(x) === Generator
         # push!(iters, get_iter(x))
         get_iters(x, iters)
-        if typof(x.args[1]) === Generator || typof(x.args[1]) === Flatten
-            get_inner_gen(x.args[1], iters, arg)
+        if typof(x[1]) === Generator || typof(x[1]) === Flatten
+            get_inner_gen(x[1], iters, arg)
         else
-            push!(arg, x.args[1])
+            push!(arg, x[1])
         end
     end
     return iters, arg
@@ -756,17 +872,17 @@ end
 
 function get_iter(x)
     if typof(x) === Generator
-        return x.args[3]
+        return x[3]
     end
 end
 
 function get_iters(x, iters)
     iters1 = []
     if typof(x) === Generator
-        # return x.args[3]
+        # return x[3]
         for i = 3:length(x.args)
-            if typof(x.args[i]) !== PUNCTUATION
-                push!(iters1, x.args[i])
+            if typof(x[i]) !== PUNCTUATION
+                push!(iters1, x[i])
             end
         end
     end
@@ -774,21 +890,21 @@ function get_iters(x, iters)
 end
 
 function convert_iter_assign(a)
-    if isbinarycall(a) && (is_in(a.args[2]) || is_elof(a.args[2]))
-        return Expr(:(=), to_Expr(a.args[1]), to_Expr(a.args[3]))
+    if isbinarycall(a) && (is_in(a[2]) || is_elof(a[2]))
+        return Expr(:(=), to_Expr(a[1]), to_Expr(a[3]))
     else
         return to_Expr(a)
     end
 end
 
 function _get_import_block(x, i, ret)
-    while is_dot(x.args[i + 1])
+    while is_dot(x[i + 1])
         i += 1
         push!(ret.args, :.)
     end
-    while i < length(x.args) && !(is_comma(x.args[i + 1]))
+    while i < length(x.args) && !(is_comma(x[i + 1]))
         i += 1
-        a = x.args[i]
+        a = x[i]
         if !(ispunctuation(a)) && !(is_dot(a) || is_colon(a))
             push!(ret.args, to_Expr(a))
         end
@@ -806,7 +922,7 @@ function expr_import(x, kw)
     i = 1 # skip keyword
     while i < length(x.args)
         i += 1
-        a = x.args[i]
+        a = x[i]
         if is_colon(a)
             push!(header, popfirst!(args))
             push!(args, Expr(:.))
@@ -822,7 +938,6 @@ function expr_import(x, kw)
         return Expr(kw, Expr(:(:), header..., args...))
     end
 end
-
 
 
 const UNICODE_OPS_REVERSE = Dict{Tokenize.Tokens.Kind,Symbol}()
